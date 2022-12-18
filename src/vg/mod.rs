@@ -8,20 +8,21 @@ use serde::Deserialize;
 use serde_aux::field_attributes::deserialize_number_from_string;
 
 use crate::{
+    error::LVMError,
     lv::{LVCreateOptions, LogicalVolume},
-    run_cmd, validate_name,
+    run_cmd, ResourceCapacity, ResourceName, ResourceSelector, ResourceUUID,
 };
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct VolumeGroup {
     #[serde(rename = "vg_name")]
-    pub name: String,
+    pub name: ResourceName,
 
-    #[serde(
-        rename = "vg_size",
-        deserialize_with = "deserialize_number_from_string"
-    )]
-    pub capacity_bytes: u64,
+    #[serde(rename = "vg_uuid")]
+    pub uuid: ResourceUUID,
+
+    #[serde(rename = "vg_size")]
+    pub capacity_bytes: ResourceCapacity,
 
     #[serde(deserialize_with = "deserialize_number_from_string")]
     pub lv_count: usize,
@@ -47,10 +48,7 @@ impl VolumeGroup {
     pub fn create(
         physical_devices: Vec<String>,
         opts: VGCreateOptions,
-    ) -> Result<VolumeGroup, Box<dyn std::error::Error>> {
-        // Make sure that the volume group is valid
-        validate_name(&opts.name)?;
-
+    ) -> Result<VolumeGroup, LVMError> {
         let max_logical_volumes = opts.max_logical_volumes.unwrap_or_default().to_string();
         let max_physical_volumes = opts.max_physical_volumes.unwrap_or_default().to_string();
         let mut args = vec![
@@ -69,19 +67,14 @@ impl VolumeGroup {
         args.extend(physical_devices.iter().map(|pv| pv.as_str()));
 
         // Create the volume group (has no output)
-        run_cmd::<String>("vgcreate", &args, None::<&str>)
-            .map_err(|err| format!("could not create vg: {}", err.to_string()))?;
+        run_cmd::<String>("vgcreate", &args, None::<&str>)?;
 
         // Return the newly created volume
-        Self::get(&opts.name)
-            .map_err(|err| format!("could not get recently created vg: {}", err.to_string()).into())
+        Self::from_id(&opts.name)
     }
 
     /// Get a specific [VolumeGroup] by its name
-    pub fn get(volume_group: impl AsRef<str>) -> Result<VolumeGroup, Box<dyn std::error::Error>> {
-        // Make sure that the volume group is valid
-        validate_name(volume_group.as_ref())?;
-
+    pub fn from_id(volume_group: &ResourceName) -> Result<VolumeGroup, LVMError> {
         let args = vec![
             "--nolocking",
             "--options",
@@ -92,17 +85,18 @@ impl VolumeGroup {
             // Deterministically return sorted by `vg_name`
             "--sort",
             "vg_name",
-            volume_group.as_ref(),
+            &volume_group,
         ];
 
         run_cmd("vgs", &args, Some("vg")).and_then(|mut lvs| {
-            lvs.pop()
-                .ok_or("could not get specified volume group".into())
+            lvs.pop().ok_or(LVMError::NotFound {
+                resource: volume_group.to_string(),
+            })
         })
     }
 
     /// Get all available [VolumeGroup]s on this system
-    pub fn list() -> Result<Vec<VolumeGroup>, Box<dyn std::error::Error>> {
+    pub fn list() -> Result<Vec<VolumeGroup>, LVMError> {
         // Attempt to not modify the system as it is read
         let args = vec![
             "--nolocking",
@@ -120,36 +114,58 @@ impl VolumeGroup {
     }
 
     /// List all [LogicalVolume]s for this volume group
-    pub fn list_lvs(&self) -> Result<Vec<LogicalVolume>, Box<dyn std::error::Error>> {
+    pub fn list_lvs(&self) -> Result<Vec<LogicalVolume>, LVMError> {
         LogicalVolume::list_for_vg(&self.name)
     }
 
     /// Add a [LogicalVolume] to the volume group
-    pub fn add_lv(
-        &self,
-        opts: LVCreateOptions,
-    ) -> Result<LogicalVolume, Box<dyn std::error::Error>> {
+    pub fn add_lv(&self, opts: LVCreateOptions) -> Result<LogicalVolume, LVMError> {
         LogicalVolume::create(&self.name, opts)
     }
 
     /// Remove a [LogicalVolume] from the volume group
-    pub fn remove_lv(&self, name: impl AsRef<str>) -> Result<(), Box<dyn std::error::Error>> {
-        let lv = LogicalVolume::get(&self.name, &name)?;
+    pub fn remove_lv(&self, name: &ResourceName) -> Result<(), LVMError> {
+        let lv = LogicalVolume::from_id(&self.name, &name)?;
 
         lv.delete()
     }
 }
 
+impl ResourceSelector for VolumeGroup {
+    fn from_uuid(uuid: &ResourceUUID) -> Result<Self, LVMError>
+    where
+        Self: Sized + std::fmt::Debug + serde::de::DeserializeOwned,
+    {
+        let selector = format!("uuid={}", uuid);
+        let args = vec![
+            "--nolocking",
+            "--options",
+            "+vg_all",
+            "--units",
+            "b",
+            "--nosuffix",
+            "--select",
+            &selector,
+        ];
+
+        run_cmd("vgs", &args, Some("vg")).and_then(|mut lvs| {
+            lvs.pop().ok_or(LVMError::NotFound {
+                resource: uuid.to_string(),
+            })
+        })
+    }
+}
+
 pub struct VGCreateOptions {
     /// The name of the [VolumeGroup]
-    name: String,
+    name: ResourceName,
 
     /// Whether to enable clustered mode
     is_clustered: Option<bool>,
 
     /// Whether to enforce a maximum amount of allowed [LogicalVolume]s
-    max_logical_volumes: Option<u64>,
+    max_logical_volumes: Option<usize>,
 
     /// Whether to enforce a maximum amount of allowed physical volumes
-    max_physical_volumes: Option<u64>,
+    max_physical_volumes: Option<usize>,
 }
